@@ -4,7 +4,9 @@ import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import authRoutes from "./routes/auth.routes.js";
 import esignRoutes from "./routes/esign.routes.js";
+import alertRoutes from "./routes/alert.routes.js";
 import { verifyToken } from "./middlewares/auth.middleware.js";
+import { globalErrorHandler } from "./middlewares/error.middleware.js";
 import { otpLimiter } from "./middlewares/rateLimiter.middleware.js";
 import pinoHttp from "pino-http";
 import { logger } from "./utils/logger.js";
@@ -48,6 +50,12 @@ app.get('/', (req: Request, res: Response) => {
     timestamp: new Date().toISOString()
   });
 });
+
+// Alert Routes (Must be registered before the global error handler)
+app.use("/api/alerts", alertRoutes);
+
+// Global Error Handler (Must be the last middleware)
+app.use(globalErrorHandler);
 
 const PORT = env.PORT;
 

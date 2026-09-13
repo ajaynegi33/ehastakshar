@@ -12,6 +12,7 @@ import { getStorageProvider } from "../services/storage.service.js";
 import { OtpRepository } from "../repositories/OtpRepository.js";
 import { logger } from "../utils/logger.js";
 import { env } from "../config/env.js";
+import { DigitalSignatureService } from "../services/DigitalSignatureService.js";
 import PDFDocumentKit from "pdfkit";
 import { UserRepository } from "../repositories/UserRepository.js";
 
@@ -327,7 +328,8 @@ export class ESignController {
       });
 
       // Generate a temporary JWT token specifically for the signing step to prevent replay attacks
-      const signToken = AuthService.generateToken(recipient.id);
+      const ipAddress = (req.ip || req.socket.remoteAddress || "").toString();
+      const signToken = AuthService.generateToken(recipient.id, ipAddress);
 
       res.status(200).json({ message: "OTP verified", signToken });
     } catch (error) {
@@ -341,12 +343,36 @@ export class ESignController {
    */
   static async signDocument(req: Request, res: Response): Promise<void> {
     try {
-      // In reality, you'd extract and verify the `signToken` JWT here.
-      const { token, signatureText } = req.body;
+      const { token, signatureText, signToken, consentGranted, consentTimestamp } = req.body;
       const recipient = await DocumentRecipientRepository.findBySecureToken(token);
+      
+      if (consentGranted !== "true") {
+        res.status(400).json({ error: "Explicit consent is required to sign the document." });
+        return;
+      }
       
       if (!recipient || recipient.status === "SIGNED") {
         res.status(400).json({ error: "Invalid token or already signed" });
+        return;
+      }
+
+      // Verify OTP signToken to prevent bypass
+      if (!signToken) {
+        res.status(401).json({ error: "Missing signing token. Please verify OTP first." });
+        return;
+      }
+      
+      const payload = AuthService.verifyToken(signToken);
+      if (!payload || payload.userId !== recipient.id) {
+        res.status(401).json({ error: "Invalid or expired signing token" });
+        return;
+      }
+      
+      // Verify IP Address binding
+      const currentIp = (req.ip || req.socket.remoteAddress || "").toString();
+      if (payload.ipAddress && payload.ipAddress !== currentIp) {
+        logger.warn({ expectedIp: payload.ipAddress, actualIp: currentIp }, "IP Address mismatch during signing");
+        res.status(401).json({ error: "Session hijacked. IP Address changed since OTP verification." });
         return;
       }
 
@@ -366,99 +392,21 @@ export class ESignController {
       }
       const fileBuffer = Buffer.concat(chunks);
 
-      // 2. Manipulate PDF
-      const pdfDoc = await PDFDocument.load(fileBuffer);
-      const pages = pdfDoc.getPages();
-      const lastPage = pages[pages.length - 1];
-
-      // Use a built-in font for now, ideally load a cursive font TTF
-      const font = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
-      
-      const istFormatter = new Intl.DateTimeFormat('en-IN', {
-        timeZone: 'Asia/Kolkata',
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false
-      });
-      const formattedDate = istFormatter.format(new Date());
-      const signatureString = `Date: ${formattedDate} IST`;
-      
-      let embeddedSignatureImage: any = null;
-      let signatureDims = { width: 0, height: 0 };
-      
-      if (req.body.signatureUrl) {
-        try {
-          const imageRes = await fetch(req.body.signatureUrl);
-          const imageArrayBuffer = await imageRes.arrayBuffer();
-          // Extremely basic magic number check for PNG
-          const firstByte = new Uint8Array(imageArrayBuffer)[0];
-          if (firstByte === 0x89) {
-            embeddedSignatureImage = await pdfDoc.embedPng(imageArrayBuffer);
-          } else {
-            embeddedSignatureImage = await pdfDoc.embedJpg(imageArrayBuffer);
-          }
-          signatureDims = embeddedSignatureImage.scaleToFit(140, 50);
-        } catch (err) {
-          logger.error({ err }, "Failed to embed signature image in PDF");
-        }
-      }
-      
-      pages.forEach((page) => {
-        const { width, height } = page.getSize();
-        
-        const boxWidth = 150;
-        const textHeight = 12; // Height for one line of date text
-        const innerPadding = 4;
-        const imgHeight = embeddedSignatureImage ? signatureDims.height : 0;
-        const imgWidth = embeddedSignatureImage ? signatureDims.width : 0;
-        
-        const totalHeight = imgHeight + textHeight + (innerPadding * 3);
-        
-        const padding = 20;
-        const boxX = width - boxWidth - padding;
-        const boxY = padding;
-        
-        // Draw the border box
-        page.drawRectangle({
-          x: boxX,
-          y: boxY,
-          width: boxWidth,
-          height: totalHeight,
-          borderColor: rgb(0, 0, 0),
-          borderWidth: 1,
-        });
-
-        // Draw image if exists
-        if (embeddedSignatureImage) {
-          page.drawImage(embeddedSignatureImage, {
-            x: boxX + (boxWidth - imgWidth) / 2, // Center horizontally
-            y: boxY + textHeight + (innerPadding * 2), // Stack above the text
-            width: imgWidth,
-            height: imgHeight,
-          });
-        }
-
-        // Draw the text inside the box (bottom part)
-        page.drawText(signatureString, {
-          x: boxX + innerPadding,
-          y: boxY + innerPadding + 2, // Slightly above bottom edge
-          size: 8,
-          font,
-          color: rgb(0, 0, 0),
-          lineHeight: 11,
-        });
+      // 2. Manipulate PDF - Cryptographic Sealing
+      const ipAddress = (req.ip || req.socket.remoteAddress || "").toString();
+      const pdfWithPlaceholder = await DigitalSignatureService.addSignaturePlaceholder(fileBuffer, {
+        transactionId: document.transactionId,
+        recipientName: recipient.name,
+        signatureUrl: req.body.signatureUrl,
+        ipAddress: ipAddress
       });
 
-      const signedPdfBytes = await pdfDoc.save();
+      const signedPdfBuffer = await DigitalSignatureService.sealDocument(pdfWithPlaceholder);
 
       // 3. Upload signed document back
       // Using a temporary stream to upload the Buffer
       const { Readable } = await import("stream");
-      const signedStream = Readable.from(Buffer.from(signedPdfBytes));
+      const signedStream = Readable.from(signedPdfBuffer);
       
       // Upload replacing or creating a new version
       const newFileUrl = await storageProvider.upload(`signed_${document.id}.pdf`, "application/pdf", signedStream);
@@ -489,6 +437,16 @@ export class ESignController {
             logger.error({ err: e }, "Geocoding error");
           }
         }
+
+        // Log explicit consent
+        await AuditLogRepository.logEvent({
+          documentId: document.id,
+          recipientId: recipient.id,
+          action: "CONSENT_GRANTED",
+          ipAddress: req.ip || req.socket.remoteAddress || "",
+          userAgent: userAgentStr,
+          timestamp: consentTimestamp ? new Date(consentTimestamp) : new Date(),
+        });
 
         await AuditLogRepository.logEvent({
           documentId: document.id,

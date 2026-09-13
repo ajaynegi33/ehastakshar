@@ -10,7 +10,6 @@
     "check-types": "turbo run check-types"
   },
   "dependencies": {
-    "prettier": "^3.6.0",
     "turbo": "^2.9.6"
   },
   "engines": {

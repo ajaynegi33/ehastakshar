@@ -3,6 +3,7 @@ import { Plus_Jakarta_Sans, Inter } from "next/font/google";
 import "./globals.css";
 import { ReactNode } from "react";
 import { Toaster } from 'sonner';
+import { GlobalErrorBoundary } from "@/components/GlobalErrorBoundary";
 
 const jakarta = Plus_Jakarta_Sans({
   variable: "--font-jakarta-sans",
@@ -49,7 +50,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         />
       </head>
       <body className="min-h-full flex flex-col">
-        {children}
+        <GlobalErrorBoundary>
+          {children}
+        </GlobalErrorBoundary>
         <Toaster position="bottom-right" richColors />
       </body>
     </html>
